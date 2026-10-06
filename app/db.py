@@ -527,6 +527,25 @@ def latest_paper_deletion_at(conn: sqlite3.Connection, paper_id: str) -> str | N
     return row["at"] if row is not None else None
 
 
+def latest_paper_deletion_serial(conn: sqlite3.Connection, paper_id: str) -> int | None:
+    """某编号最近一次删除所冻结的发布序号; 从未删除返回 None。
+
+    用于评审人操作的删除状态校验: 当前发布序号不晚于该冻结序号时,
+    当前发布方案中该稿的槽位仍是删除前的历史槽位, 同编号重录但未重新
+    发布时同样命中; 重新发布 (普通/补位, 发布序号严格 +1) 后当前序号
+    严格大于该冻结序号, 槽位属于重新发布后的新方案, 恢复可操作。
+    删除发生于从未发布时冻结序号为 NULL (此时该稿不可能在任何发布方案中)。
+    """
+    row = conn.execute(
+        "SELECT published_serial AS serial FROM paper_deletions"
+        " WHERE paper_id = ? ORDER BY id DESC LIMIT 1",
+        (paper_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["serial"]
+
+
 def invalidate_snapshots_for_paper_deletion(
     conn: sqlite3.Connection, paper_id: str
 ) -> int:

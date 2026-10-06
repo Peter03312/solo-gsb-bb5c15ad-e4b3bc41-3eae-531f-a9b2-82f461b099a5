@@ -296,6 +296,48 @@ def _load_published(conn):
     ).fetchone()
 
 
+def _paper_slot_is_deleted_stale(conn, *, paper_id: str, serial: int) -> bool:
+    """该 (论文, 发布序号) 槽位是否属于"删除生命周期"的历史槽位。
+
+    会务方删除论文后, 即使当前发布方案仍保留该稿删除前的历史槽位,
+    评审人的确认/回避/正式评语/更正提交也必须一律拒绝:
+      - 论文已删除且尚未同编号重录: 资料行已不存在;
+      - 同编号已重录但尚未重新发布分配: 当前发布序号仍是删除时冻结的旧序号,
+        当前槽位不是重新发布后的新槽位。
+    判定依据 paper_deletions 最近一次删除凭据冻结的发布序号:
+    serial <= 冻结序号即删除生命周期的历史槽位, 按"未分配任务"同形 404 拒绝。
+    重新发布 (普通/补位) 使发布序号严格 +1, serial > 冻结序号后槽位属于新方案,
+    评审人方可在新序号下重新确认并重新提交。
+    """
+    frozen_serial = db.latest_paper_deletion_serial(conn, paper_id)
+    return frozen_serial is not None and serial <= frozen_serial
+
+
+def _reject_if_paper_deleted_stale(conn, *, paper_id: str, serial: int):
+    """评审人写操作的删除状态校验 (同一写事务内调用, 命中即抛 404)。"""
+    if _paper_slot_is_deleted_stale(conn, paper_id=paper_id, serial=serial):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"论文 {paper_id} 已被会务方删除, 当前发布方案中的槽位仅为历史保留,"
+                " 不再接受评审人的确认、回避或正式评语; 同编号重新录入并重新发布后,"
+                " 请按新的发布序号重新操作"
+            ),
+        )
+
+
+def _stale_deleted_paper_ids(conn, paper_ids, serial: int) -> set:
+    """一批论文编号中, 在 serial 下属于"删除生命周期历史槽位"的编号集合。
+
+    供评审人只读视图过滤: 已删除 (含同编号重录但未重新发布) 的论文不出现在
+    取稿、本人评语、本人待更正任务及逾期任务视图中; 会务方追溯视图不受影响。
+    """
+    return {
+        pid for pid in paper_ids
+        if _paper_slot_is_deleted_stale(conn, paper_id=pid, serial=serial)
+    }
+
+
 def _load_decisions(conn, serial):
     """读取某发布序号下每个分配槽位的决定。返回 {(paper_id, reviewer_id): row}。"""
     return {
@@ -383,10 +425,15 @@ def _build_backfill(conn, published_row):
             "SELECT paper_id FROM papers WHERE withdrawn = 1"
         ).fetchall()
     }
+    # 删除稿 (含同编号重录但未重新发布) 的历史槽位: 删除前的旧确认/旧评语不固定、
+    # 不沿用, 重录稿在补位中作为全新论文重算两个槽位; 这些槽位也不产生逾期重分。
+    stale_deleted_paper_ids = _stale_deleted_paper_ids(conn, plan.keys(), serial)
+    for pid in stale_deleted_paper_ids:
+        fixed.pop(pid, None)
     overdue_pairs = {
         (rid, pid)
         for (pid, rid) in _overdue_pairs(conn, serial, plan, now)
-        if pid not in withdrawn_paper_ids
+        if pid not in withdrawn_paper_ids and pid not in stale_deleted_paper_ids
     }
     # 求解器 barred_pairs 约定为 (reviewer_id, paper_id);
     # overdue_slots 明细仍按 (paper_id, reviewer_id) 输出, 与状态视图一致
@@ -1515,10 +1562,16 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                 "SELECT paper_id FROM papers WHERE withdrawn = 1"
             ).fetchall()
         }
+        stale_deleted_paper_ids = _stale_deleted_paper_ids(conn, plan.keys(), serial)
         expired = (
             deadline is not None and now >= datetime.fromisoformat(deadline["deadline_at"])
         )
         overdue = _overdue_pairs(conn, serial, plan, now) if expired else set()
+        # 删除生命周期的历史槽位不再接受评审操作, 与撤回稿一样不计逾期、不列入汇总
+        overdue = {
+            (pid, rid) for (pid, rid) in overdue
+            if pid not in stale_deleted_paper_ids
+        }
         slots = []
         summary = {
             "unconfirmed": 0,
@@ -1528,11 +1581,13 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
             "overdue": 0,
         }
         withdrawn_slots = 0
+        deleted_slots = 0
         for pid in sorted(plan):
             for rid in plan[pid]:
                 d = decisions.get((pid, rid))
                 r = reviews.get((pid, rid))
                 is_withdrawn = pid in withdrawn_paper_ids
+                is_deleted_stale = pid in stale_deleted_paper_ids
                 if d is not None and d["state"] == "recused":
                     state = "recused"
                 elif r is not None:
@@ -1545,6 +1600,8 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                     state = "unconfirmed"
                 if is_withdrawn:
                     withdrawn_slots += 1
+                elif is_deleted_stale:
+                    deleted_slots += 1
                 else:
                     summary[state] += 1
                 slots.append(
@@ -1557,6 +1614,7 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                         "recused": d is not None and d["state"] == "recused",
                         "receipt": r["receipt"] if r is not None else None,
                         "withdrawn": is_withdrawn,
+                        "deleted": is_deleted_stale,
                     }
                 )
         return {
@@ -1567,6 +1625,7 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
             "server_time": now.isoformat(),
             "summary": summary,
             "withdrawn_slots": withdrawn_slots,
+            "deleted_slots": deleted_slots,
             "slots": slots,
         }
 
@@ -1660,6 +1719,9 @@ def get_published(_: bool = Depends(require_organizer)):
                 "SELECT paper_id, reason FROM paper_withdrawals"
             ).fetchall()
         }
+        # 删除生命周期历史槽位 (删除后含同编号重录但未重新发布): 仅供会务方
+        # 在当前发布版视图中核对, 评审人侧一律不可见、不可操作
+        stale_deleted_paper_ids = _stale_deleted_paper_ids(conn, plan.keys(), row["serial"])
     for pid, pair in plan.items():
         slots = []
         for rid in pair:
@@ -1673,9 +1735,11 @@ def get_published(_: bool = Depends(require_organizer)):
                 }
             )
         is_withdrawn = pid in withdrawn_paper_ids
+        is_deleted_stale = pid in stale_deleted_paper_ids
         papers.setdefault(pid, {"assigned": pair})["slots"] = slots
         papers[pid]["withdrawn"] = is_withdrawn
         papers[pid]["withdrawal_reason"] = withdrawal_reasons.get(pid) if is_withdrawn else None
+        papers[pid]["deleted"] = is_deleted_stale
     return {
         "serial": row["serial"],
         "revision": row["revision"],
@@ -1683,6 +1747,9 @@ def get_published(_: bool = Depends(require_organizer)):
         "plan": plan,
         "papers": papers,
         "withdrawn_papers": sorted(pid for pid in plan if pid in withdrawn_paper_ids),
+        # 删除后当前发布方案保留的历史槽位清单 (同编号重录但未重新发布时仍在此;
+        # 重新发布推进序号后自动清空); 删除凭据见 /papers/{id}/deletions
+        "deleted_papers": sorted(stale_deleted_paper_ids),
     }
 
 
@@ -1872,6 +1939,17 @@ def _create_review_correction(conn, *, paper_id: str, serial: int, reviewer_id: 
         raise HTTPException(
             status_code=409,
             detail=f"论文 {paper_id} 已撤回, 不可再发起评语更正 (历史记录保留供追溯)",
+        )
+    if _paper_slot_is_deleted_stale(conn, paper_id=paper_id, serial=current_serial):
+        # 删除生命周期的历史槽位 (含同编号重录但未重新发布) 不接受新的更正请求:
+        # 旧评语仅供会务方追溯; 重新发布后新槽位须重新确认、重新提交,
+        # 届时再按新序号槽位上的新评语发起更正。
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"论文 {paper_id} 已被会务方删除, 当前发布方案中的槽位仅为历史保留,"
+                " 不可发起评语更正; 同编号重新录入并重新发布后请按新发布序号的新评语发起"
+            ),
         )
     if reviewer_id not in pair:
         raise HTTPException(
@@ -2729,6 +2807,10 @@ def submit_decision(
                 status_code=404,
                 detail=f"论文 {paper_id} 已撤回, 不再接受评审决定",
             )
+        # 删除状态校验优先于一切状态/幂等/截止判定: 会务方删除后历史槽位
+        # 即使仍在当前发布方案中也一律拒绝, 不写决定/硬回避, 不推进修订号;
+        # 同编号重录但未重新发布 (旧序号) 同样拒绝。
+        _reject_if_paper_deleted_stale(conn, paper_id=paper_id, serial=published["serial"])
         serial = published["serial"]
         existing = conn.execute(
             "SELECT state, reason FROM assignment_decisions"
@@ -2837,11 +2919,14 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
                 "SELECT paper_id FROM papers WHERE withdrawn = 1"
             ).fetchall()
         }
-        mine = sorted(
-            pid
-            for pid, rs in plan.items()
+        candidate_pids = [
+            pid for pid, rs in plan.items()
             if reviewer_id in rs and pid not in withdrawn_paper_ids
-        )
+        ]
+        # 已删除 (含同编号重录但未重新发布) 的历史槽位同样不授权取稿,
+        # 不出现在 assignments/recused/states 与逾期任务列表中 (历史由会务方追溯)
+        stale_deleted_pids = _stale_deleted_paper_ids(conn, candidate_pids, serial)
+        mine = sorted(pid for pid in candidate_pids if pid not in stale_deleted_pids)
         deadline = db.load_review_deadline(conn, serial)
         now = _utcnow()
         deadline_expired = (
@@ -2851,7 +2936,9 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
             _overdue_pairs(conn, serial, plan, now) if deadline_expired else set()
         )
         overdue_papers = sorted(
-            pid for (pid, rid) in overdue_pairs if rid == reviewer_id
+            pid
+            for (pid, rid) in overdue_pairs
+            if rid == reviewer_id and pid not in stale_deleted_pids
         )
         out, recused, states = [], [], {}
         for pid in mine:
@@ -2948,6 +3035,10 @@ def submit_review(
                 status_code=404,
                 detail=f"论文 {paper_id} 已撤回, 不再接受正式评语",
             )
+        # 删除状态校验优先于槽位状态、既有评语、幂等与截止判定: 删除稿的历史槽位
+        # 不接受正式评语, 不写评语/收据, 不推进资料修订号; 同编号重录但未重新发布
+        # (旧序号) 同样拒绝, 重新发布后须在新序号下重新确认并重新提交。
+        _reject_if_paper_deleted_stale(conn, paper_id=paper_id, serial=current_serial)
         decision = conn.execute(
             "SELECT state FROM assignment_decisions"
             " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
@@ -3046,11 +3137,15 @@ def reviewer_reviews(reviewer_id: str = Depends(require_active_reviewer)):
                 "SELECT paper_id FROM papers WHERE withdrawn = 1"
             ).fetchall()
         }
-        out = []
-        for pid in sorted(
+        candidate_pids = [
             pid for pid, rs in plan.items()
             if reviewer_id in rs and pid not in withdrawn_paper_ids
-        ):
+        ]
+        # 删除稿历史槽位上的评语仅供会务方追溯, 不出现在评审人本人视图中;
+        # 同编号重录重新发布后属于新序号下的新槽位, 旧评语不沿用、不显示。
+        stale_deleted_pids = _stale_deleted_paper_ids(conn, candidate_pids, serial)
+        out = []
+        for pid in sorted(pid for pid in candidate_pids if pid not in stale_deleted_pids):
             d = decisions.get((pid, reviewer_id))
             if d is None or d["state"] != "confirmed":
                 continue  # pending/已回避/撤回/被移出的槽位均非本人当前有效任务
@@ -3092,6 +3187,12 @@ def reviewer_correction_tasks(reviewer_id: str = Depends(require_active_reviewer
             " ORDER BY rc.id",
             (serial, reviewer_id),
         ).fetchall()
+        # 删除后同编号重录但未重新发布时, JOIN 会重新命中重录行; 该旧序号下的
+        # 更正任务随删除失效, 不得列出 (重新发布后为新序号, 自然不会再命中)。
+        stale_deleted_pids = _stale_deleted_paper_ids(
+            conn, [r["paper_id"] for r in rows], serial
+        )
+        rows = [r for r in rows if r["paper_id"] not in stale_deleted_pids]
     return {
         "reviewer_id": reviewer_id,
         "serial": serial,
@@ -3148,6 +3249,9 @@ def submit_review_correction(
                 status_code=404,
                 detail=f"论文 {paper_id} 已撤回, 不存在可提交更正的任务",
             )
+        # 删除稿的历史槽位不存在可提交的更正任务: 不更新评语/收据, 不写完成记录;
+        # 同编号重录后须经重新发布、重新确认与重新提交, 不沿用旧更正流程。
+        _reject_if_paper_deleted_stale(conn, paper_id=paper_id, serial=current_serial)
         corr = conn.execute(
             "SELECT * FROM review_corrections"
             " WHERE serial = ? AND paper_id = ? AND reviewer_id = ? AND original_receipt = ?",
@@ -3372,9 +3476,14 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
         db.expire_pending_objections(conn, new_serial, now)
         # 仍在新方案中的槽位保留确认状态 (已回避槽位不可能出现在新方案中);
         # 连续保留的确认槽位连同其正式评语一并沿用 (原收据/时间不变);
-        # 被移出槽位的评语保留在旧序号下, 仅供会务方追溯, 不计入新方案进度
+        # 被移出槽位的评语保留在旧序号下, 仅供会务方追溯, 不计入新方案进度。
+        # 删除生命周期例外: 删除稿 (含同编号重录后) 在新序号下属于新槽位,
+        # 删除前的旧确认/旧评语一律不沿用——评审人须按新序号重新确认、重新提交;
+        # 旧记录保留在旧序号下供会务方追溯。
+        stale_deleted_pids = _stale_deleted_paper_ids(conn, new_plan.keys(), serial)
         carried = 0
         carried_reviews = 0
+        dropped_deleted_confirmations = 0
         for pid, pair in new_plan.items():
             for rid in pair:
                 d = old_decisions.get((pid, rid))
@@ -3383,6 +3492,10 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
                         # 逾期槽位即使仍出现在新方案中 (求解器已禁止该对, 正常不会),
                         # 也绝不沿用其确认状态; 并计数会务方可见的"逾期释放确认"。
                         released_overdue_confirmations += 1
+                        continue
+                    if pid in stale_deleted_pids:
+                        # 删除前的历史确认绝不沿用到重新发布后的新槽位
+                        dropped_deleted_confirmations += 1
                         continue
                     conn.execute(
                         "INSERT INTO assignment_decisions"
@@ -3423,6 +3536,8 @@ def backfill_publish(body: BackfillPublishIn, _: bool = Depends(require_organize
         "carried_confirmations": carried,
         "carried_reviews": carried_reviews,
         "released_overdue_confirmations": released_overdue_confirmations,
+        # 删除稿 (含同编号重录后) 的历史确认不沿用到新序号槽位的数量
+        "dropped_deleted_confirmations": dropped_deleted_confirmations,
         "overdue_slots": result["overdue_slots"],
         "plan": new_plan,
     }

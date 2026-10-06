@@ -3,9 +3,14 @@
 #
 #   1) 发布/确认/评语/快照/作者异议 -> 会务方删除 P1:
 #      同一写事务内旧快照访问码失效、待处理异议过期 (响应含失效快照数/过期异议数);
+#      当前发布方案保留删除瞬间的历史槽位 (发布序号不变) 供会务方核对,
+#      但评审人对该稿的确认/回避/正式评语一律 404 (不写决定/硬回避/评语、
+#      不推进资料修订号; 既有决定/评语的幂等重试同样拒绝), 取稿列表不再含该稿;
 #      持码读取与异议提交对旧码返回与无效码同形的 404; 查询凭据仍可查 expired;
 #      历史快照/异议/删除凭据由会务方追溯;
-#   2) 同编号重新录入 -> 重新发布分配 (发布序号推进) -> 新快照新访问码:
+#   2) 同编号重新录入 -> 重新发布分配 (发布序号推进) -> 评审人按新序号重新确认、
+#      重新交评语 -> 新快照新访问码:
+#      重新发布前 (旧序号) 评审操作仍 404; 补位重发同样不沿用删除前旧确认/旧评语;
 #      旧码持续 404, 不恢复效力; 删除凭据记录每次删除;
 #   3) 迁移 (v2, 含 paper_deletions): 空目标实例恢复后旧码死、新码活;
 #      把旧快照失效标记改回有效并重算校验和的伪造快照 -> 422 矛盾快照、不留部分数据;
@@ -72,7 +77,37 @@ print("    ok 失效快照:", d["invalidated_snapshots"], "过期异议:", d["ex
 print("    删除时刻:", d["deleted_at"])
 PY
 
-echo "== 4. 旧码持码读取 / 提交新异议: 与无效码同形 404 (不透露论文是否存在) =="
+echo "== 4. 删除后历史槽位仍保留在发布方案, 但评审人确认/回避/评语一律 404 =="
+# 会务方视角: 当前发布版与发布序号不变, P1 的历史槽位仍冻结保留供核对
+curl -s "$BASE/assignment" -H "$ORG" \
+  | j '{"serial": d["serial"], "P1_historical_slots": d["plan"]["P1"]}'
+REV_AFTER_DELETE=$(curl -s "$BASE/meta" -H "$ORG" | j 'd["revision"]')
+# R1 删除前已确认: 幂等重试确认、确认后改回避全部 404 (不允许走 changed=false 旁路)
+echo "    R1 重复确认 -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/decision" \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"confirm"}') (404)"
+echo "    R1 改回避   -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/decision" \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"recuse","reason":"删除后回避"}') (404)"
+# R2 删除前未操作: 新确认/首次回避同样 404, 不写硬回避
+echo "    R2 确认     -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/decision" \
+  -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"confirm"}') (404)"
+echo "    R2 回避     -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/decision" \
+  -H 'X-Reviewer-Id: R2' -H 'X-Reviewer-Credential: r2-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"recuse","reason":"删除后回避"}') (404)"
+# 正式评语 (含已交评语的同内容幂等重试) 一律 404, 不写评语/收据
+echo "    R1 交评语   -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/review" \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' \
+  -d "{\"paper_id\":\"P1\",\"serial\":$SER,\"score\":1,\"comment\":\"删除后不应写入\"}") (404)"
+# 取稿列表立即不再包含该稿; 被拒操作不推进资料修订号 (仍为删除推进后的 $REV_AFTER_DELETE)
+curl -s "$BASE/reviewer/assignments" -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  | j '{"serial": d["serial"], "assignments": [a["paper_id"] for a in d["assignments"]]}'
+curl -s "$BASE/meta" -H "$ORG" \
+  | j '{"revision_unchanged_after_rejected_ops": (d["revision"] == '"$REV_AFTER_DELETE"'), "revision": d["revision"], "hard_recusals_for_P1": [h for h in d["hard_recusals"] if h["paper_id"] == "P1"]}'
+
+echo "== 5. 旧码持码读取 / 提交新异议: 与无效码同形 404 (不透露论文是否存在) =="
 BOGUS=fbk-00000000000000000000000000000000
 for desc_url in \
   "旧码读取|$BASE/feedback-snapshots/$OLD_CODE" \
@@ -84,7 +119,7 @@ echo "    旧码提交异议 -> HTTP $(code -X POST "$BASE/feedback-objections" 
   -H 'Content-Type: application/json' \
   -d "{\"access_code\":\"$OLD_CODE\",\"label\":2,\"reason\":\"删除后提交\"}") (404)"
 
-echo "== 5. 作者查询凭据继续可查 (expired); 会务方可追溯历史快照/异议/删除凭据 =="
+echo "== 6. 作者查询凭据继续可查 (expired); 会务方可追溯历史快照/异议/删除凭据 =="
 curl -s "$BASE/feedback-objections/$OBJ_TOKEN" \
   | j '{"paper_id": d["paper_id"], "state": d["state"], "resolved_at": d["resolved_at"]}'
 curl -s "$BASE/papers/P1/feedback-snapshots" -H "$ORG" \
@@ -92,19 +127,27 @@ curl -s "$BASE/papers/P1/feedback-snapshots" -H "$ORG" \
 curl -s "$BASE/papers/P1/deletions" -H "$ORG" \
   | j '[{"id": x["id"], "state": x["state"], "invalidated_snapshots": x["invalidated_snapshots"], "expired_objections": x["expired_objections"]} for x in d["deletions"]]'
 
-echo "== 6. 同编号重新录入 + 重新发布分配 (发布序号推进): 旧码仍 404 =="
+echo "== 7. 同编号重新录入 + 重新发布分配 (发布序号推进): 旧码仍 404 =="
 curl -s -o /dev/null -X POST "$BASE/papers" -H "$ORG" -H 'Content-Type: application/json' -d '{
   "paper_id": "P1", "manuscript": "同编号重录稿", "topics": ["AI"], "institutions": ["Univ-Y"]}'
+echo "    重录但尚未重新发布 (当前序号仍为冻结旧序号 $SER): 评审操作仍 404"
+echo "      R1 确认   -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/decision" \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' -d '{"paper_id":"P1","decision":"confirm"}') (404)"
+echo "      R1 交评语 -> HTTP $(code -X POST "$BASE/reviewer/assignments/P1/review" \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' \
+  -d "{\"paper_id\":\"P1\",\"serial\":$SER,\"score\":2,\"comment\":\"重录未重发前仍拒绝\"}") (404)"
 REV=$(curl -s -X POST "$BASE/assignment/dry-run" -H "$ORG" | j 'd["revision"]')
 SER2=$(curl -s -X POST "$BASE/assignment/publish" -H "$ORG" -H 'Content-Type: application/json' \
   -d "{\"base_revision\": $REV}" | j 'd["serial"]')
-echo "    重新发布: serial=$SER2"
+echo "    重新发布: serial=$SER2 (新序号下槽位为新槽位, 删除前旧确认/旧评语不沿用)"
 echo "    未重新发布分配前按旧序号重发相同收据快照 -> 409 (不返回旧码/不覆盖历史):"
 echo "      HTTP $(code -X POST "$BASE/papers/P1/feedback-snapshot" -H "$ORG" \
-  -H 'Content-Type: application/json' -d "{\"serial\": 1}") (409)"
+  -H 'Content-Type: application/json' -d "{\"serial\": $SER}") (409)"
 echo "    重新发布分配后旧码读取 -> HTTP $(code "$BASE/feedback-snapshots/$OLD_CODE") (404, 不复活)"
 
-echo "== 7. 重录后重新确认/交评语, 发布新快照: version+1 与新访问码 =="
+echo "== 8. 重录后重新确认/交评语, 发布新快照: version+1 与新访问码 =="
 for spec in 'R1 r1-secret 3 重录 R1 评语' 'R2 r2-secret 4 重录 R2 评语'; do
   set -- $spec
   curl -s -o /dev/null -X POST "$BASE/reviewer/assignments/P1/decision" \
@@ -123,7 +166,7 @@ echo "    旧码读取 -> HTTP $(code "$BASE/feedback-snapshots/$OLD_CODE") (404
 curl -s "$BASE/papers/P1/feedback-snapshots" -H "$ORG" \
   | j '[{"version": s["version"], "serial": s["serial"], "active": s["active"]} for s in d["snapshots"]]'
 
-echo "== 8. 导出 v2 一致快照 (含 paper_deletions 删除凭据) 并本地复算校验和 =="
+echo "== 9. 导出 v2 一致快照 (含 paper_deletions 删除凭据) 并本地复算校验和 =="
 curl -s "$BASE/migration/export" -H "$ORG" > "$SNAP"
 python3 - "$SNAP" <<'PY'
 import hashlib, json, sys
@@ -136,7 +179,7 @@ assert "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest() == snap["ch
 print(f"    format_version=2, 删除凭据 {len(dels)} 条, 校验和一致")
 PY
 
-echo "== 9. 空目标实例恢复合法快照: 旧码死/新码活/删除凭据可追溯 =="
+echo "== 10. 空目标实例恢复合法快照: 旧码死/新码活/删除凭据可追溯 =="
 curl -s -X POST "$BASE2/migration/restore" -H "$ORG" -H 'Content-Type: application/json' \
   --data-binary @"$SNAP" | j "{'ok': d['ok'], 'format_version': d['format_version'], 'revision': d['revision'], 'serial': d['serial'], 'paper_deletions': d['counts']['paper_deletions']}"
 echo "    恢复后新码读取 -> HTTP $(code "$BASE2/feedback-snapshots/$NEW_CODE") (200)"
@@ -147,7 +190,7 @@ echo "    旧码提交异议 -> HTTP $(code -X POST "$BASE2/feedback-objections"
 curl -s "$BASE2/papers/P1/deletions" -H "$ORG" \
   | j '{"deletions": [{"id": x["id"], "published_serial": x["published_serial"]} for x in d["deletions"]]}'
 
-echo "== 10. 复活攻击: 把删除前旧快照 invalidated 改回有效并重算校验和 -> 422, 不留部分数据 =="
+echo "== 11. 复活攻击: 把删除前旧快照 invalidated 改回有效并重算校验和 -> 422, 不留部分数据 =="
 python3 - "$SNAP" "$OLD_CODE" "$FORGED" <<'PY'
 import hashlib, json, sys
 snap_path, old_code, out_path = sys.argv[1:4]
@@ -165,7 +208,7 @@ echo "    伪造快照恢复 -> HTTP $(curl -s -o /tmp/pd-forged-resp.json -w '%
   --data-binary @"$FORGED") (422)"
 python3 -c 'import json; print("   ", json.load(open("/tmp/pd-forged-resp.json"))["detail"])'
 
-echo "== 11. 旧格式 v1 (无删除记载) 恢复沿用原有判断, 不推断删除历史 =="
+echo "== 12. 旧格式 v1 (无删除记载) 恢复沿用原有判断, 不推断删除历史 =="
 python3 - "$SNAP" "$OLD_CODE" "$LEGACY" <<'PY'
 import hashlib, json, sys
 snap_path, old_code, out_path = sys.argv[1:4]
