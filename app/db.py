@@ -51,6 +51,12 @@
   每次删除追加一行; 删除行还冻结删除瞬间的发布序号与槽位、本次失效快照数/过期
   异议数, 既是会务方追溯依据, 也是迁移恢复时跨记录重算访问码效力的凭据
   (仅靠快照自报 invalidated 标记无法防止被改回有效的伪造快照)。
+  冻结的发布序号 (published_serial) 同时是评审人侧删除状态的判定依据: 删除后
+  当前发布版不重写, 历史槽位仍留在 published.plan 中, 但该序号已被删除凭据冻结
+  (paper_deleted_after_publish)——评审人的确认/回避/正式评语/评语更正一律拒绝,
+  且不写新决定/硬回避/评语/更正、不推进资料修订号, 取稿列表/本人评语/待更正
+  任务也不再呈现; 同编号重新录入但未重新发布时旧序号仍冻结, 只有重新发布
+  (普通发布/补位发布推进序号) 后评审人才能按新发布序号重新确认并提交。
 - paper_guarantee_levels 表保存会务方按论文设置的评审保障等级 (high/medium;
   未设置即普通 normal, 不落行, 设置为 normal 即清除该行): 仅在普通分配/补位
   无法完整覆盖各自目标论文时参与求解——先使完整分配的论文总数最大, 再依次使
@@ -525,6 +531,29 @@ def latest_paper_deletion_at(conn: sqlite3.Connection, paper_id: str) -> str | N
         (paper_id,),
     ).fetchone()
     return row["at"] if row is not None else None
+
+
+def paper_deleted_after_publish(
+    conn: sqlite3.Connection, paper_id: str, serial: int
+) -> bool:
+    """该论文的当前发布序号槽位是否已随删除失效 (删除凭据冻结的序号 == serial)。
+
+    会务方删除论文时当前发布版不重写: 历史槽位仍留在 published.plan 中, 但该槽位
+    冻结进删除凭据 (paper_deletions.published_serial 记录删除瞬间的发布序号)。
+    评审人侧一切写操作 (确认/回避/正式评语/评语更正) 与取稿视图必须据此拒绝:
+      - 删除后、同编号重新录入但尚未重新发布时, 当前发布序号仍是删除时冻结的旧
+        序号 -> 返回 True, 旧槽位继续失效;
+      - 重新录入并重新发布 (普通发布/补位发布推进序号) 后, 删除凭据冻结的旧序号
+        严格小于新序号 -> 返回 False, 评审人按新序号重新确认并提交;
+      - 从未发布方案或删除瞬间该稿不在方案中时冻结序号为 NULL, 不会命中。
+    同一编号可多次"删除 -> 重录": 只要存在一行冻结序号等于当前序号即视为已删除。
+    """
+    row = conn.execute(
+        "SELECT 1 FROM paper_deletions"
+        " WHERE paper_id = ? AND published_serial = ? LIMIT 1",
+        (paper_id, serial),
+    ).fetchone()
+    return row is not None
 
 
 def invalidate_snapshots_for_paper_deletion(
